@@ -1,24 +1,69 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  ClusterName:
+    Type: String
+    Description: The name of the ECS cluster, you need manege.
+  ServiceName:
+    Type: String
+    Description: The name of the ECS service, you update number.
+  DayCount:
+    Type: Number
+    Description: The number of ECS service needed during the day (default is 1).
+    Default: 1
+  NightCount:
+    Type: Number
+    Description: The number of ECS service needed during the night (default is 0).
+    Default: 0
+  DayStartTime:
+    Type: Number
+    Description: The time to start ECS service during the day (default is 8).
+    Default: 8
+  NightStartTime:
+    Description: The time to stop ECS service during the night (default is 21).
+    Type: Number
+    Default: 21
 Resources:
-  HelloWorldFunction:
+  UpdateECSServiceFunction:
     Type: 'AWS::Lambda::Function'
     Properties:
-      FunctionName: 'HelloWorldFunction'
+      FunctionName: 'UpdateECSServiceFunction'
       Handler: index.handler
-      Runtime: nodejs14.x
+      Runtime: nodejs18.x
       Role: 
         Fn::GetAtt:
           - LambdaExecutionRole
           - Arn
       Code:
         ZipFile: |
+          const { ECSClient, UpdateServiceCommand } = require("@aws-sdk/client-ecs");
+
           exports.handler = async(event) => {
-            console.log("hello");
-            const response = {
-                statusCode: 200,
-                body: JSON.stringify('Hello from Lambda!'),
+            console.log("Received payload: ", event);
+            const client = new ECSClient();
+            const params = {
+              service: event.ServiceName,
+              cluster: event.ClusterName,
+              desiredCount: event.DesiredCount
             };
-            return response;
+
+            const command = new UpdateServiceCommand(params);
+
+            try {
+              const data = await client.send(command);
+              console.log("Service updated successfully: ", data);
+              const response = {
+                  statusCode: 200,
+                  body: JSON.stringify('Service updated successfully!'),
+              };
+              return response;
+            } catch (error) {
+              console.error("Error updating service: ", error);
+              const response = {
+                  statusCode: 500,
+                  body: JSON.stringify('Error updating service.'),
+              };
+              return response;
+            }
           };
       Description: A starter AWS Lambda function.
       MemorySize: 128
@@ -36,6 +81,18 @@ Resources:
                 - lambda.amazonaws.com
             Action:
               - 'sts:AssumeRole'
+      Policies: 
+      - PolicyName: ECSLimitedAccessPolicy
+        PolicyDocument: 
+          Version: '2012-10-17'
+          Statement: 
+            - Effect: Allow
+              Action: 
+                - 'ecs:UpdateService'
+                - 'ecs:DescribeServices'
+              Resource: 
+                - Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ClusterName}/*
+
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
         
@@ -44,3 +101,106 @@ Resources:
     Properties:
       LogGroupName: "/aws/lambda/myLambdaFunction"
       RetentionInDays: 14
+
+  UpdateECSServiceStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: UpdateECSServiceStateMachine
+      DefinitionString:
+        Fn::Sub:
+          - |-
+            {
+              "StartAt": "UpdateECSService",
+              "States": {
+                "UpdateECSService": {
+                  "Type": "Task",
+                  "Resource": "${UpdateECSServiceFunction}",
+                  "Parameters": {
+                    "ClusterName.$": "$.ClusterName",
+                    "ServiceName.$": "$.ServiceName",
+                    "DesiredCount.$": "$.DesiredCount"
+                  },
+                  "End": true
+                }
+              }
+            }
+          - UpdateECSServiceFunction: !GetAtt UpdateECSServiceFunction.Arn
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsExecutionRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt UpdateECSServiceStateMachine.Arn
+
+  ScheduleRuleBeforeWorkHours:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Start ECS service before work hours'
+      ScheduleExpression: !Sub 'cron(0 ${DayStartTime} ? * MON-FRI *)'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt UpdateECSServiceStateMachine.Arn
+          Id: 'TargetFunctionV1'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Input: !Sub
+            -  '{"ClusterName": "${ClusterName}", "ServiceName": "${ServiceName}", "DesiredCount": ${DayCount}}'
+            - ClusterName: !Ref ClusterName
+              ServiceName: !Ref ServiceName
+              DayCount: !Ref DayCount
+
+  ScheduleRuleAfterWorkHours:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Stop ECS service after work hours'
+      ScheduleExpression: !Sub 'cron(0 ${NightStartTime} * * ? *)'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt UpdateECSServiceStateMachine.Arn
+          Id: 'TargetFunctionV2'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Input: !Sub
+            - '{"ClusterName": "${ClusterName}", "ServiceName": "${ServiceName}", "DesiredCount": ${NightCount}}'
+            - ClusterName: !Ref ClusterName
+              ServiceName: !Ref ServiceName
+              NightCount: !Ref NightCount
+
+  EventBridgeExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StartStepFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: 
+                  - !GetAtt UpdateECSServiceStateMachine.Arn
