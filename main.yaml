@@ -6,6 +6,10 @@ Parameters:
   ServiceName:
     Type: String
     Description: The name of the ECS service, you update number.
+  ECSRegion:
+    Type: String
+    Description: The region of the ECS service.
+    Default: ap-northeast-1
   DayCount:
     Type: Number
     Description: The number of ECS service needed during the day (default is 1).
@@ -16,10 +20,10 @@ Parameters:
     Default: 0
   DayStartTime:
     Type: Number
-    Description: The time to start ECS service during the day (default is 8).
+    Description: The time(UTC) to start ECS service during the day (default is 8).
     Default: 8
   NightStartTime:
-    Description: The time to stop ECS service during the night (default is 21).
+    Description: The time(UTC) to stop ECS service during the night (default is 21).
     Type: Number
     Default: 21
 Resources:
@@ -39,7 +43,7 @@ Resources:
 
           exports.handler = async(event) => {
             console.log("Received payload: ", event);
-            const client = new ECSClient();
+            const client = new ECSClient({ region: event.ECSRegion });
             const params = {
               service: event.ServiceName,
               cluster: event.ClusterName,
@@ -65,7 +69,47 @@ Resources:
               return response;
             }
           };
-      Description: A starter AWS Lambda function.
+      Description: A Lambda function to update the desired count of an ECS service.
+      MemorySize: 128
+      Timeout: 20
+
+  WaitForStableFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'WaitForStableFunction'
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: 
+        Fn::GetAtt:
+          - LambdaExecutionRole
+          - Arn
+      Code:
+        ZipFile: |
+          const { ECSClient, UpdateServiceCommand } = require("@aws-sdk/client-ecs");
+
+          exports.handler = async(event) => {
+            console.log("Received payload: ", event);
+            const client = new ECSClient({ region: event.ECSRegion });
+            try {
+              const result = await waitUntilServicesStable(
+                { client, maxWaitTime: 15 * 60, maxDelay: 30, minDelay: 15 },
+                {
+                  cluster: event.ClusterName,
+                  services: [event.ServiceName],
+                }
+              );
+              console.log("Services are stable: ", result);
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify("Services are stable"),
+              };
+            } catch (error) {
+              console.log("Error waiting for services to stabilize: ", error);
+              throw new Error("Error waiting for services to stabilize: ", error);
+            }
+          };
+      Description: A Lambda function to check the stability of an ECS service.
       MemorySize: 128
       Timeout: 20
 
@@ -95,37 +139,58 @@ Resources:
 
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-        
-  MyLogGroup:
-    Type: "AWS::Logs::LogGroup"
-    Properties:
-      LogGroupName: "/aws/lambda/myLambdaFunction"
-      RetentionInDays: 14
 
-  UpdateECSServiceStateMachine:
+  EcsServiceStateMachine:
     Type: 'AWS::StepFunctions::StateMachine'
     Properties:
-      StateMachineName: UpdateECSServiceStateMachine
+      StateMachineName: EcsServiceStateMachine
       DefinitionString:
         Fn::Sub:
           - |-
             {
-              "StartAt": "UpdateECSService",
+              "StartAt": "UpdateService",
               "States": {
-                "UpdateECSService": {
+                "UpdateService": {
                   "Type": "Task",
                   "Resource": "${UpdateECSServiceFunction}",
                   "Parameters": {
-                    "ClusterName.$": "$.ClusterName",
-                    "ServiceName.$": "$.ServiceName",
+                    "ClusterName": "${ClusterName}",
+                    "ServiceName": "${ServiceName}",
+                    "ECSRegion": "${ECSRegion}",
                     "DesiredCount.$": "$.DesiredCount"
                   },
-                  "End": true
+                  "Next": "WaitForStable",
+                  "Catch": [{
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Fail"
+                  }]
+                },
+                "WaitForStable": {
+                  "Type": "Task",
+                  "Resource": "${WaitForStableFunction}",
+                  "Parameters": {
+                    "ClusterName": "${ClusterName}",
+                    "ServiceName": "${ServiceName}",
+                    "ECSRegion": "${ECSRegion}"
+                  },
+                  "End": true,
+                  "Catch": [{
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Fail"
+                  }]
+                },
+                "Fail": {
+                  "Type": "Fail",
+                  "Cause": "ServiceUpdateFailed"
                 }
               }
             }
           - UpdateECSServiceFunction: !GetAtt UpdateECSServiceFunction.Arn
-      RoleArn: !GetAtt LambdaExecutionRole.Arn
+            WaitForStableFunction: !GetAtt WaitForStableFunction.Arn
+            ClusterName: !Ref ClusterName
+            ServiceName: !Ref ServiceName
+            ECSRegion: !Ref ECSRegion
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
 
   StepFunctionsExecutionRole:
     Type: 'AWS::IAM::Role'
@@ -148,23 +213,22 @@ Resources:
                 Action:
                   - 'lambda:InvokeFunction'
                 Resource:
-                  - !GetAtt UpdateECSServiceStateMachine.Arn
+                  - !GetAtt UpdateECSServiceFunction.Arn
+                  - !GetAtt WaitForStableFunction.Arn
 
   ScheduleRuleBeforeWorkHours:
     Type: 'AWS::Events::Rule'
     Properties:
       Description: 'Start ECS service before work hours'
-      ScheduleExpression: !Sub 'cron(0 ${DayStartTime} ? * MON-FRI *)'
+      ScheduleExpression: !Sub 'cron(0 ${DayStartTime} * * ? *)'
       State: 'ENABLED'
       Targets:
-        - Arn: !GetAtt UpdateECSServiceStateMachine.Arn
+        - Arn: !GetAtt EcsServiceStateMachine.Arn
           Id: 'TargetFunctionV1'
           RoleArn: !GetAtt EventBridgeExecutionRole.Arn
           Input: !Sub
-            -  '{"ClusterName": "${ClusterName}", "ServiceName": "${ServiceName}", "DesiredCount": ${DayCount}}'
-            - ClusterName: !Ref ClusterName
-              ServiceName: !Ref ServiceName
-              DayCount: !Ref DayCount
+            -  '{"DesiredCount": ${DayCount}}'
+            - DayCount: !Ref DayCount
 
   ScheduleRuleAfterWorkHours:
     Type: 'AWS::Events::Rule'
@@ -173,14 +237,12 @@ Resources:
       ScheduleExpression: !Sub 'cron(0 ${NightStartTime} * * ? *)'
       State: 'ENABLED'
       Targets:
-        - Arn: !GetAtt UpdateECSServiceStateMachine.Arn
+        - Arn: !GetAtt EcsServiceStateMachine.Arn
           Id: 'TargetFunctionV2'
           RoleArn: !GetAtt EventBridgeExecutionRole.Arn
           Input: !Sub
-            - '{"ClusterName": "${ClusterName}", "ServiceName": "${ServiceName}", "DesiredCount": ${NightCount}}'
-            - ClusterName: !Ref ClusterName
-              ServiceName: !Ref ServiceName
-              NightCount: !Ref NightCount
+            - '{"DesiredCount": ${NightCount}}'
+            - NightCount: !Ref NightCount
 
   EventBridgeExecutionRole:
     Type: 'AWS::IAM::Role'
@@ -203,4 +265,4 @@ Resources:
                 Action:
                   - 'states:StartExecution'
                 Resource: 
-                  - !GetAtt UpdateECSServiceStateMachine.Arn
+                  - !GetAtt EcsServiceStateMachine.Arn
