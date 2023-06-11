@@ -21,7 +21,7 @@ This template is effective in these cases
 ## Usage
 You can give it a try by under [quick-create links](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-create-stacks-quick-create-links.html).
 
-https://ap-northeast-1.console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/create/review?templateURL=https://cf-okamos-ecs-number-controller.s3.ap-northeast-3.amazonaws.com/main.yaml&stackName=EcsNumberController
+https://ap-northeast-1.console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/create/review?templateURL=https://cf-okamos-ecs-number-controller.s3.ap-northeast-3.amazonaws.com/main.yaml&stackName=ECSNumberController
 
 ### Parameters
 | Parameter | Description | Default |
@@ -37,8 +37,3 @@ https://ap-northeast-1.console.aws.amazon.com/cloudformation/home?region=ap-nort
 ## License
 
 [MIT](https://choosealicense.com/licenses/mit/)
-
-## Recommended Tools
-https://github.com/aws-cloudformation/cfn-lint
-
-

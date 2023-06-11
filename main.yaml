@@ -1,4 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Description: This Cloud Formation template is designed to increase and decrease the number of ECS Services.
 
 Parameters:
   ClusterName:
