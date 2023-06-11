@@ -1,11 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
+
 Parameters:
   ClusterName:
     Type: String
-    Description: The name of the ECS cluster, you need manege.
+    Description: The name of the ECS cluster you need to manage.
   ServiceName:
     Type: String
-    Description: The name of the ECS service, you update number.
+    Description: The name of the ECS service for which you want to update the number.
   ECSRegion:
     Type: String
     Description: The region of the ECS service.
